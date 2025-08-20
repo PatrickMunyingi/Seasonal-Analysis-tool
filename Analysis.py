@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import altair as alt
+import plotly.express as px
 
 st.set_page_config(page_title="Seasonal Explorer", layout="wide")
 st.title("Seasonal Data Explorer")
@@ -55,7 +56,7 @@ def load_table(file):
 
 def coerce_datetime(series: pd.Series):
     try:
-        return pd.to_datetime(series, errors="coerce", dayfirst=False, infer_datetime_format=True)
+        return pd.to_datetime(series, errors="coerce", dayfirst=False)
     except Exception:
         return pd.to_datetime(series, errors="coerce")
 
@@ -97,10 +98,30 @@ if df is None:
 df.columns = df.columns.map(lambda s: str(s).strip())
 
 # pick date column
-date_cols_guess = [c for c in df.columns if 'date' in c.lower()]
-with st.sidebar:
-    date_col = st.selectbox("Date column", options=df.columns.tolist(),
-                            index=(df.columns.get_loc(date_cols_guess[0]) if date_cols_guess else 0))
+# --- find the date column (no UI) ---
+def find_date_col(df: pd.DataFrame) -> str:
+    # 1) exact/common names first
+    for cand in ["date", "Date", "DATE", "timestamp", "Timestamp", "datetime", "Datetime"]:
+        if cand in df.columns:
+            return cand
+    # 2) fuzzy match on name
+    name_hits = [c for c in df.columns if "date" in str(c).lower()]
+    if name_hits:
+        return name_hits[0]
+    # 3) dtype-based guess
+    dt_hits = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
+    if dt_hits:
+        return dt_hits[0]
+    # 4) last resort: raise so you notice
+    raise ValueError("Could not find a date column. Please add one named like 'Date' or 'date'.")
+
+date_col = find_date_col(df)
+
+# --- coerce dates (handles messy strings) ---
+df[date_col] = pd.to_datetime(df[date_col], errors="coerce", dayfirst=False)
+if df[date_col].isna().all():
+    st.error(f"Failed to parse any dates in column '{date_col}'. Check the raw values.")
+
 
 # coerce dates
 _df = df.copy()
@@ -161,11 +182,43 @@ for c in value_cols:
         lta_map[c] = f"{c}_LTA"
 
 st.markdown("---")
-view_mode = st.radio("View / Analysis", ["By Season", "By Region", "Summary (all regions)"])
+view_mode = st.radio("View / Analysis", ["Global view","By Season","Summary (all regions)"])
 
 def apply_mark(chart: alt.Chart, chart_type: str, point: bool=False):
     """Return chart with the requested mark."""
     return chart.mark_line(point=point) if chart_type == "Line" else chart.mark_bar()
+#----------------------------
+#Global View(Across all years)
+#----------------------------
+if view_mode == "Global view":
+    sel_regions = st.multiselect("Regions to plot", options=base_regions, default=base_regions)
+
+    chart_type = st.radio("Chart Type", ["Line", "Bar"], horizontal=True, key="chart_global")
+
+    if not sel_regions:
+        st.warning("Choose at least one region to plot.")
+    else:
+        m = seasonal[["season_label"] + sel_regions].melt(
+            id_vars=["season_label"], var_name="region", value_name="value"
+        )
+
+        base = alt.Chart(m).encode(
+            x=alt.X("season_label:N", title="Season"),
+            y=alt.Y("value:Q", title=f"{agg_method} over regions"),
+            color="region:N",  # <— gives separate line per region
+            tooltip=[
+                alt.Tooltip("season_label:N"),
+                alt.Tooltip("value:Q", format=",.3f"),
+                alt.Tooltip("region:N"),
+            ],
+        ).properties(height=420, title=f"{agg_method} by season")
+
+        if chart_type == "Line":
+            ch = base.mark_line(point=True)
+        else:
+            ch = base.mark_bar()
+
+        st.altair_chart(ch, use_container_width=True)
 
 # ---------------------------
 # VIEW: BY SEASON (compare regions within a chosen season)
@@ -197,58 +250,6 @@ if view_mode == "By Season":
 
         chart = apply_mark(base, chart_type, point=True)
         st.altair_chart(chart, use_container_width=True)
-
-# ---------------------------
-# VIEW: BY REGION (focus on one region; across seasons aggregate OR within-season timeline with LTA)
-# ---------------------------
-elif view_mode == "By Region":
-    r = st.selectbox("Region", options=base_regions)
-    sub_mode = st.radio("Compare", ["Across seasons (aggregate)", "Within one season (timeline)"])
-
-    if sub_mode == "Across seasons (aggregate)":
-        chart_type = st.radio("Chart Type", ["Line", "Bar"], horizontal=True, key="chart_region_agg")
-
-        sub = seasonal[["season_label", r]].rename(columns={r: "value"})
-        base = alt.Chart(sub).encode(
-            x=alt.X(field="season_label", type="nominal", title="Season"),
-            y=alt.Y(field="value", type="quantitative", title=f"{agg_method} over season"),
-            tooltip=[alt.Tooltip(field="season_label", type="nominal"),
-                     alt.Tooltip(field="value", type="quantitative", format=",.3f")]
-        ).properties(height=420, title=f"{r}: {agg_method} by season")
-
-        ch = apply_mark(base, chart_type, point=True)
-        st.altair_chart(ch, use_container_width=True)
-
-    else:
-        chart_type = st.radio("Chart Type", ["Line", "Bar"], horizontal=True, key="chart_region_timeline")
-
-        sel_season = st.selectbox("Season", options=season_labels,
-                                  index=len(season_labels)-1 if season_labels else 0, key="region_season")
-        y = label_to_year[sel_season]
-        within = filtered[filtered["season_year"] == y].copy()
-        cols = [r]
-        lta_col = lta_map.get(r)
-        if lta_col:
-            show_lta = st.checkbox(f"Overlay LTA ({lta_col})", value=True)
-            if show_lta:
-                cols.append(lta_col)
-
-        m = within[[date_col] + cols].melt(id_vars=[date_col], var_name="series", value_name="value")
-
-        base = alt.Chart(m).encode(
-            x=alt.X(field=date_col, type="temporal", title="Date"),
-            y=alt.Y(field="value", type="quantitative", title="Value"),
-            color=alt.Color(field="series", type="nominal", title="Series"),
-            tooltip=[
-                alt.Tooltip(field="series", type="nominal"),
-                alt.Tooltip(field=date_col, type="temporal"),
-                alt.Tooltip(field="value", type="quantitative", format=",.3f")
-            ]
-        ).properties(height=420, title=f"{r} — {sel_season}")
-
-        ch = apply_mark(base, chart_type, point=True)
-        st.altair_chart(ch, use_container_width=True)
-
 # ---------------------------
 # VIEW: SUMMARY (pivot by season x region + per-region stats)
 # ---------------------------

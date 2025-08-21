@@ -12,7 +12,6 @@ st.markdown(
     """
     **New in v2**
     - Toggle **By Season**, **By Region**, or **Summary (all regions)** views.
-    - Optional **LTA overlay** if you include columns named like `REGION_LTA`.
     - Downloads for pivot and per-region stats.
     - **Chart Type** toggle (Line ↔ Bar) for line charts.
     """
@@ -380,3 +379,4 @@ with col2:
                        file_name="filtered_rows.csv", mime="text/csv")
 
 st.caption("Tip: If the file is huge, pre-aggregate (daily→monthly) before upload to speed things up.")
+

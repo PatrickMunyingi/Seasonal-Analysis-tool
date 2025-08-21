@@ -182,43 +182,134 @@ for c in value_cols:
         lta_map[c] = f"{c}_LTA"
 
 st.markdown("---")
-view_mode = st.radio("View / Analysis", ["Global view","By Season","Summary (all regions)"])
+view_mode = st.radio("View / Analysis", ["Global view","By Season", "Summary (all regions)"])
 
 def apply_mark(chart: alt.Chart, chart_type: str, point: bool=False):
     """Return chart with the requested mark."""
     return chart.mark_line(point=point) if chart_type == "Line" else chart.mark_bar()
+
 #----------------------------
-#Global View(Across all years)
+# Global View (Across all years) — Polished
 #----------------------------
 if view_mode == "Global view":
     sel_regions = st.multiselect("Regions to plot", options=base_regions, default=base_regions)
-
     chart_type = st.radio("Chart Type", ["Line", "Bar"], horizontal=True, key="chart_global")
+
+    # Rolling/LTA controls
+    add_ma = st.checkbox("Add rolling average (long-term average)", value=True)
+    window_unit = st.radio("Window unit", ["Seasons", "Days"], horizontal=True, key="ma_unit")
+    if window_unit == "Seasons":
+        ma_win_seasons = st.slider("Rolling window (in seasons)", 2, 10, 5, key="ma_win_seasons")
+    else:
+        ma_win_days = st.slider("Rolling window (in days)", 30, 365, 90, step=30, key="ma_win_days")
 
     if not sel_regions:
         st.warning("Choose at least one region to plot.")
     else:
-        m = seasonal[["season_label"] + sel_regions].melt(
-            id_vars=["season_label"], var_name="region", value_name="value"
-        )
+        # Base seasonal (observed)
+        m = seasonal[["season_year", "season_label"] + sel_regions].melt(
+            id_vars=["season_year", "season_label"], var_name="region", value_name="value"
+        ).sort_values(["region", "season_year"])
 
-        base = alt.Chart(m).encode(
-            x=alt.X("season_label:N", title="Season"),
+        # Rolling data (time-based if Days, k-season if Seasons)
+        ma_title = ""
+        if add_ma:
+            if window_unit == "Seasons":
+                ma_title = f"{ma_win_seasons}-season rolling avg"
+                roll_series = (
+                    m.groupby("region", group_keys=False)["value"]
+                     .apply(lambda s: s.rolling(window=ma_win_seasons, min_periods=1).mean())
+                )
+                m["roll"] = roll_series
+                ma_for_plot = m[["season_label", "region", "roll"]].dropna().copy()
+            else:
+                ma_title = f"{ma_win_days}-day rolling avg"
+                pieces = []
+                for r in sel_regions:
+                    tmp = filtered[[date_col, "season_label", r]].dropna().sort_values(date_col).copy()
+                    tmp = tmp.set_index(pd.to_datetime(tmp[date_col]))
+                    tmp["roll"] = tmp[r].rolling(f"{ma_win_days}D", min_periods=1).mean()
+                    collapsed = (
+                        tmp.reset_index(drop=True)
+                           .groupby("season_label", as_index=False)["roll"].agg(agg_func)
+                           .assign(region=r)
+                    )
+                    pieces.append(collapsed)
+                ma_for_plot = pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
+
+            # merge so tooltips on the observed line can also show rolling value
+            if not ma_for_plot.empty:
+                m = m.merge(ma_for_plot, on=["season_label", "region"], how="left", suffixes=("", "_ma"))
+
+        # Interactive legend selection (click legend to focus)
+        sel = alt.selection_point(fields=["region"], bind="legend")
+
+        # Common encodings
+        x_enc = alt.X(
+            "season_label:N",
+            title="Season",
+            axis=alt.Axis(labelAngle=-35, labelLimit=140, ticks=False)
+        )
+        color_enc = alt.Color("region:N", title="Region", scale=alt.Scale(scheme="tableau10"))
+
+        # Title & subtitle
+        chart_title = {
+            "text": f"{agg_method} by season",
+            "subtitle": ["Solid = Observed", "Dashed diamond = Rolling average"] if add_ma else []
+        }
+        if add_ma and ma_title:
+            chart_title["subtitle"] = [*chart_title["subtitle"], f"Overlay: {ma_title}"]
+
+        # Observed series (line or bar) with larger markers
+        base_obs = alt.Chart(m).encode(
+            x=x_enc,
             y=alt.Y("value:Q", title=f"{agg_method} over regions"),
-            color="region:N",  # <— gives separate line per region
+            color=color_enc,
             tooltip=[
-                alt.Tooltip("season_label:N"),
-                alt.Tooltip("value:Q", format=",.3f"),
-                alt.Tooltip("region:N"),
+                alt.Tooltip("season_label:N", title="Season"),
+                alt.Tooltip("region:N", title="Region"),
+                alt.Tooltip("value:Q", title="Observed", format=",.3f"),
+                alt.Tooltip("roll:Q", title="Rolling Avg", format=",.3f") if add_ma else alt.value(None),
             ],
-        ).properties(height=420, title=f"{agg_method} by season")
+            opacity=alt.condition(sel, alt.value(1.0), alt.value(0.25))
+        ).properties(height=460, title=chart_title)
 
         if chart_type == "Line":
-            ch = base.mark_line(point=True)
+            ch_obs = base_obs.mark_line(point=alt.OverlayMarkDef(size=85, filled=True, strokeWidth=2))
         else:
-            ch = base.mark_bar()
+            ch_obs = base_obs.mark_bar()
 
-        st.altair_chart(ch, use_container_width=True)
+        layers = [ch_obs]
+
+        # Rolling overlay: dashed line + diamond markers
+        if add_ma and not ma_for_plot.empty:
+            ma_line = (
+                alt.Chart(ma_for_plot)
+                  .mark_line(strokeDash=[6, 4], strokeWidth=2, opacity=0.95)
+                  .encode(x=x_enc, y="roll:Q", color=color_enc, opacity=alt.condition(sel, alt.value(1.0), alt.value(0.25)))
+            )
+            ma_pts = (
+                alt.Chart(ma_for_plot)
+                  .mark_point(shape="diamond", size=70, filled=True, opacity=0.9)
+                  .encode(x=x_enc, y="roll:Q", color=color_enc, opacity=alt.condition(sel, alt.value(1.0), alt.value(0.25)))
+            )
+            layers += [ma_line, ma_pts]
+
+        # Optional: overall mean reference line (across selected regions & seasons)
+        if not m.empty:
+            overall_mean = float(m["value"].mean())
+            rule_df = pd.DataFrame({"y": [overall_mean]})
+            rule = (
+                alt.Chart(rule_df)
+                  .mark_rule(strokeDash=[2, 2], opacity=0.6)
+                  .encode(y="y:Q")
+                  .properties()
+            )
+            layers.append(rule)
+
+        chart = alt.layer(*layers).add_params(sel)
+        st.altair_chart(chart, use_container_width=True)
+
 
 # ---------------------------
 # VIEW: BY SEASON (compare regions within a chosen season)
